@@ -1,4 +1,5 @@
 import axios from 'axios';
+import * as cheerio from 'cheerio';
 import XLSX from 'xlsx';
 import fs from 'fs';
 import FormData from 'form-data';
@@ -13,14 +14,10 @@ const KEYWORDS = [
 ];
 
 const CONFIG = {
-  maxPages: 3,
-  jobsPerPage: 20,
+  maxPages: 3,          // Indeed shows 15 jobs/page
   outputFile: "ZipRecruiter_Jobs.xlsx",
+  delay: 4_000,         // ms between requests
 };
-
-// ZipRecruiter public job search API
-const API_URL = "https://api.ziprecruiter.com/jobs/v1";
-const API_KEY = "aunzHt4sMnGNzMEBeCR5KhOWsGfG4gip"; // public key embedded in their web app
 
 // ====================== HELPERS ======================
 
@@ -28,34 +25,15 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function extractSalary(job) {
-  // Try structured salary fields first
-  if (job.salary_min && job.salary_max) {
-    const min = Number(job.salary_min);
-    const max = Number(job.salary_max);
-    if (min > 0 && max > 0) {
-      const fmt = n => `$${n.toLocaleString('en-US')}`;
-      const interval = job.salary_interval || '';
-      const label = interval === 'hour' ? '/hr' : interval === 'week' ? '/wk' : interval === 'month' ? '/mo' : '/yr';
-      return `${fmt(min)} - ${fmt(max)}${label}`;
-    }
-  }
-  if (job.salary_min && Number(job.salary_min) > 0) {
-    return `$${Number(job.salary_min).toLocaleString('en-US')}+`;
-  }
-
-  // Fallback: regex on job snippet / description
-  const text = [job.snippet, job.job_description, job.name].filter(Boolean).join(' ');
-  const patterns = [
-    /(\$\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[–\-]\s*\$\d{1,3}(?:,\d{3})*(?:\.\d+)?)?(?:\s*\/\s*(?:hr|hour|yr|year|mo|month|week|wk))?)/i,
-    /(\d{2,3}[kK]\s*[–\-]\s*\d{2,3}[kK])/,
-    /(\d{5,6}\s*[–\-]\s*\d{5,6})/,
-  ];
-  for (const pat of patterns) {
-    const m = text.match(pat);
-    if (m) return m[0].trim();
-  }
-  return '';
+// Rotate user agents to avoid blocks
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+];
+function randomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
 // ====================== NOTIFICATIONS ======================
@@ -94,9 +72,9 @@ async function sendTeamsAlert(jobCount, fileLink = null) {
       "@type": "MessageCard",
       "@context": "http://schema.org/extensions",
       themeColor: "0076D7",
-      summary: "ZipRecruiter Scraper Report",
+      summary: "Indeed Scraper Report",
       sections: [{
-        activityTitle: "🎯 ZipRecruiter Scraper",
+        activityTitle: "🎯 Indeed Job Scraper",
         activitySubtitle: "Salary Filter Mode",
         facts: [{ name: "Jobs found:", value: `${jobCount}` }],
         text: fileLink ? `🔗 Download: ${fileLink}` : "",
@@ -133,66 +111,102 @@ async function sendTelegramFile(filePath) {
 
 // ====================== SCRAPE LOGIC ======================
 
-async function fetchJobsForKeyword(keyword) {
+async function fetchIndeedJobs(keyword) {
   const jobs = [];
 
-  for (let page = 1; page <= CONFIG.maxPages; page++) {
+  for (let page = 0; page < CONFIG.maxPages; page++) {
+    const start = page * 15; // Indeed paginates by 15
+    const url = `https://www.indeed.com/jobs?q=${encodeURIComponent(keyword)}&l=United+States&start=${start}&limit=15&filter=0`;
+
     try {
-      console.log(`  📄 Page ${page}...`);
+      console.log(`  📄 Page ${page + 1} (start=${start})...`);
 
-      const params = {
-        search:   keyword,
-        location: 'United States',
-        radius_miles: 5000,
-        page,
-        jobs_per_page: CONFIG.jobsPerPage,
-        api_key: API_KEY,
-      };
-
-      const res = await axios.get(API_URL, {
-        params,
+      const res = await axios.get(url, {
         headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'User-Agent': randomUA(),
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Referer': 'https://www.indeed.com/',
+          'DNT': '1',
         },
         timeout: 30_000,
       });
 
-      const data = res.data;
-      const jobList = data.jobs || [];
+      const $ = cheerio.load(res.data);
 
-      console.log(`    📦 Jobs returned: ${jobList.length}`);
+      // Save debug HTML for first keyword first page only
+      if (page === 0 && jobs.length === 0) {
+        fs.writeFileSync(`debug_${keyword.replace(/\s/g, '_')}.html`, res.data);
+        console.log(`    💾 Debug HTML saved`);
+      }
 
-      if (jobList.length === 0) {
-        console.log(`    ⚠️  No more jobs – stopping pagination`);
+      // Indeed job cards
+      const cards = $('div.job_seen_beacon, div[class*="jobsearch-ResultsList"] > li, div.resultContent');
+      console.log(`    📦 Cards found: ${cards.length}`);
+
+      cards.each((_, el) => {
+        const card = $(el);
+
+        // Title
+        const title = card.find('h2.jobTitle span[title], h2.jobTitle a span, span[title]').first().text().trim()
+          || card.find('h2 a').text().trim();
+        if (!title || title.length < 3) return;
+
+        // Company
+        const company = card.find('[data-testid="company-name"], span.companyName, [class*="companyName"]').first().text().trim() || 'N/A';
+
+        // Location
+        const location = card.find('[data-testid="text-location"], div.companyLocation, [class*="companyLocation"]').first().text().trim() || 'N/A';
+
+        // Salary — Indeed often shows it in a dedicated element
+        const salaryEl = card.find(
+          '[class*="salary"], [data-testid*="salary"], ' +
+          'div.metadata.salary-snippet-container, ' +
+          'div.salaryOnly, span.salaryText'
+        ).first().text().trim();
+
+        let salary = '';
+        if (salaryEl && salaryEl.length > 3) {
+          salary = salaryEl;
+        } else {
+          // Fallback: regex on full card text
+          const fullText = card.text().replace(/\s+/g, ' ');
+          const patterns = [
+            /(\$\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[–\-a-z]\s*\$\d{1,3}(?:,\d{3})*(?:\.\d+)?)?(?:\s*(?:a year|a month|an hour|\/hr|\/yr|\/mo|per hour|per year))?)/i,
+            /(\d{2,3}[kK]\s*[–\-]\s*\d{2,3}[kK])/,
+            /(\d{5,6}\s*[–\-]\s*\d{5,6})/,
+          ];
+          for (const pat of patterns) {
+            const m = fullText.match(pat);
+            if (m && m[0].length >= 5) { salary = m[0].trim(); break; }
+          }
+        }
+
+        if (!salary) return; // skip jobs without salary
+
+        // Link
+        const linkEl = card.find('h2 a, a[id^="job_"]').first();
+        const href = linkEl.attr('href') || '';
+        const link = href.startsWith('http') ? href.split('?')[0] : `https://www.indeed.com${href.split('?')[0]}`;
+
+        // Posted
+        const posted = card.find('[class*="date"], span.date').first().text().trim();
+
+        jobs.push({ Title: title, Company: company, Salary: salary, Location: location, Posted: posted, Link: link, Keyword: keyword });
+      });
+
+      console.log(`    💰 With salary so far: ${jobs.length}`);
+
+      if (cards.length === 0) {
+        console.log(`    ⚠️  No cards – stopping pagination`);
         break;
       }
 
-      for (const job of jobList) {
-        const salary = extractSalary(job);
-        if (!salary) continue; // skip jobs without salary
-
-        jobs.push({
-          Title:    job.name || 'N/A',
-          Company:  job.hiring_company?.name || job.source || 'N/A',
-          Salary:   salary,
-          Location: [job.city, job.state].filter(Boolean).join(', ') || job.location || 'N/A',
-          Type:     job.employment_type || '',
-          Posted:   job.posted_time_friendly || job.date_posted || '',
-          Link:     job.url || job.job_url || '',
-          Keyword:  keyword,
-        });
-      }
-
-      console.log(`    💰 With salary: ${jobs.length} total so far`);
-
-      // Respect rate limits
-      await sleep(2_000);
+      await sleep(CONFIG.delay);
 
     } catch (err) {
-      console.error(`  ❌ API error page ${page}:`, err.response?.status, err.message);
-      // If 401/403, API key may be stale — stop trying
-      if (err.response?.status === 401 || err.response?.status === 403) break;
+      console.error(`  ❌ Error page ${page + 1}:`, err.response?.status || err.message);
       await sleep(5_000);
     }
   }
@@ -203,19 +217,19 @@ async function fetchJobsForKeyword(keyword) {
 // ====================== MAIN ======================
 
 async function runScraper() {
-  console.log('🚀 Starting ZipRecruiter Scraper (API mode)...');
+  console.log('🚀 Starting Indeed Job Scraper (salary filter)...');
 
   const allJobs = [];
 
   for (const keyword of KEYWORDS) {
     console.log(`\n🔍 Keyword: "${keyword}"`);
-    const jobs = await fetchJobsForKeyword(keyword);
+    const jobs = await fetchIndeedJobs(keyword);
     allJobs.push(...jobs);
     console.log(`  ✅ "${keyword}" → ${jobs.length} jobs with salary`);
     await sleep(3_000);
   }
 
-  // De-duplicate by Link
+  // De-duplicate by link
   const seen = new Set();
   const uniqueJobs = allJobs.filter(j => {
     if (seen.has(j.Link)) return false;
@@ -236,11 +250,11 @@ async function runScraper() {
     console.log(`✅ Saved → ${CONFIG.outputFile}`);
 
     const fileLink = await uploadToCatbox(CONFIG.outputFile);
-    await sendTelegramMessage(`✅ ZipRecruiter: Found <b>${uniqueJobs.length}</b> jobs with salary!\n${fileLink ?? ''}`);
+    await sendTelegramMessage(`✅ Indeed: Found <b>${uniqueJobs.length}</b> jobs with salary!\n${fileLink ?? ''}`);
     await sendTeamsAlert(uniqueJobs.length, fileLink);
     await sendTelegramFile(CONFIG.outputFile);
   } else {
-    await sendTelegramMessage('❌ ZipRecruiter: No jobs with salary found.');
+    await sendTelegramMessage('❌ Indeed: No jobs with salary found.');
     await sendTeamsAlert(0);
     console.log('❌ No jobs with salary found.');
   }
