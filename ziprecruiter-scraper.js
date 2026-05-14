@@ -1,8 +1,7 @@
-import { chromium } from 'playwright';
+import axios from 'axios';
 import XLSX from 'xlsx';
 import fs from 'fs';
 import FormData from 'form-data';
-import axios from 'axios';
 
 // ====================== CONFIG ======================
 const KEYWORDS = [
@@ -14,20 +13,52 @@ const KEYWORDS = [
 ];
 
 const CONFIG = {
-  pageSize: 20,
-  maxPages: 2,
-  maxRetries: 2,
-  retryDelay: 8_000,
-  pageTimeout: 60_000,
-  scrollDelay: 6_000,
+  maxPages: 3,
+  jobsPerPage: 20,
   outputFile: "ZipRecruiter_Jobs.xlsx",
 };
+
+// ZipRecruiter public job search API
+const API_URL = "https://api.ziprecruiter.com/jobs/v1";
+const API_KEY = "aunzHt4sMnGNzMEBeCR5KhOWsGfG4gip"; // public key embedded in their web app
 
 // ====================== HELPERS ======================
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
+
+function extractSalary(job) {
+  // Try structured salary fields first
+  if (job.salary_min && job.salary_max) {
+    const min = Number(job.salary_min);
+    const max = Number(job.salary_max);
+    if (min > 0 && max > 0) {
+      const fmt = n => `$${n.toLocaleString('en-US')}`;
+      const interval = job.salary_interval || '';
+      const label = interval === 'hour' ? '/hr' : interval === 'week' ? '/wk' : interval === 'month' ? '/mo' : '/yr';
+      return `${fmt(min)} - ${fmt(max)}${label}`;
+    }
+  }
+  if (job.salary_min && Number(job.salary_min) > 0) {
+    return `$${Number(job.salary_min).toLocaleString('en-US')}+`;
+  }
+
+  // Fallback: regex on job snippet / description
+  const text = [job.snippet, job.job_description, job.name].filter(Boolean).join(' ');
+  const patterns = [
+    /(\$\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[–\-]\s*\$\d{1,3}(?:,\d{3})*(?:\.\d+)?)?(?:\s*\/\s*(?:hr|hour|yr|year|mo|month|week|wk))?)/i,
+    /(\d{2,3}[kK]\s*[–\-]\s*\d{2,3}[kK])/,
+    /(\d{5,6}\s*[–\-]\s*\d{5,6})/,
+  ];
+  for (const pat of patterns) {
+    const m = text.match(pat);
+    if (m) return m[0].trim();
+  }
+  return '';
+}
+
+// ====================== NOTIFICATIONS ======================
 
 async function uploadToCatbox(filePath) {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -54,8 +85,6 @@ async function uploadToCatbox(filePath) {
   }
   return null;
 }
-
-// ====================== NOTIFICATIONS ======================
 
 async function sendTeamsAlert(jobCount, fileLink = null) {
   const webhookUrl = process.env.TEAMS_WEBHOOK_URL;
@@ -104,148 +133,87 @@ async function sendTelegramFile(filePath) {
 
 // ====================== SCRAPE LOGIC ======================
 
-async function extractJobs(page, keyword) {
-  // Save debug HTML so we can inspect real page structure
-  const html = await page.content();
-  fs.writeFileSync(`debug_${keyword.replace(/\s/g, '_')}.html`, html);
-  console.log(`    💾 Saved debug HTML (${Math.round(html.length / 1024)}kb)`);
+async function fetchJobsForKeyword(keyword) {
+  const jobs = [];
 
-  return page.evaluate((kw) => {
-    const jobs = [];
+  for (let page = 1; page <= CONFIG.maxPages; page++) {
+    try {
+      console.log(`  📄 Page ${page}...`);
 
-    // Cast wide net — grab all job-looking links on the page
-    const allLinks = Array.from(document.querySelectorAll('a[href]')).filter(a =>
-      a.href.includes('/j/') ||
-      a.href.includes('/jobs/') ||
-      a.href.includes('job_id') ||
-      a.href.includes('/k/')
-    );
+      const params = {
+        search:   keyword,
+        location: 'United States',
+        radius_miles: 5000,
+        page,
+        jobs_per_page: CONFIG.jobsPerPage,
+        api_key: API_KEY,
+      };
 
-    allLinks.forEach(link => {
-      const title = link.textContent?.trim();
-      if (!title || title.length < 5) return;
-
-      // Walk up DOM to find card container with enough text
-      let card = link;
-      for (let i = 0; i < 10; i++) {
-        if (!card.parentElement) break;
-        card = card.parentElement;
-        if (card.textContent?.length > 150) break;
-      }
-
-      const fullText = card ? card.textContent.replace(/\s+/g, ' ') : '';
-
-      // Salary patterns
-      let salary = '';
-      const salaryPatterns = [
-        /(\$\d{1,3}(?:,\d{3})*(?:\.\d+)?(?:\s*[–\-]\s*\$\d{1,3}(?:,\d{3})*(?:\.\d+)?)?(?:\s*\/\s*(?:hr|hour|yr|year|mo|month|week|wk))?)/i,
-        /(\d{2,3}[kK]\s*[–\-]\s*\d{2,3}[kK])/,
-        /(\d{5,6}\s*[–\-]\s*\d{5,6})/,
-        /USD\s*\d+/i,
-      ];
-      for (const pat of salaryPatterns) {
-        const m = fullText.match(pat);
-        if (m && m[0].length >= 4) { salary = m[0].trim(); break; }
-      }
-      if (!salary) return;
-
-      jobs.push({
-        Title: title,
-        Company: 'N/A',
-        Salary: salary,
-        Location: 'N/A',
-        Type: '',
-        Posted: '',
-        Link: link.href.split('?')[0],
-        Keyword: kw,
+      const res = await axios.get(API_URL, {
+        params,
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        },
+        timeout: 30_000,
       });
-    });
 
-    return {
-      total: allLinks.length,
-      withSalary: jobs.length,
-      jobs,
-      pageTitle: document.title,
-      bodySnippet: document.body?.innerText?.substring(0, 600),
-    };
-  }, keyword);
+      const data = res.data;
+      const jobList = data.jobs || [];
+
+      console.log(`    📦 Jobs returned: ${jobList.length}`);
+
+      if (jobList.length === 0) {
+        console.log(`    ⚠️  No more jobs – stopping pagination`);
+        break;
+      }
+
+      for (const job of jobList) {
+        const salary = extractSalary(job);
+        if (!salary) continue; // skip jobs without salary
+
+        jobs.push({
+          Title:    job.name || 'N/A',
+          Company:  job.hiring_company?.name || job.source || 'N/A',
+          Salary:   salary,
+          Location: [job.city, job.state].filter(Boolean).join(', ') || job.location || 'N/A',
+          Type:     job.employment_type || '',
+          Posted:   job.posted_time_friendly || job.date_posted || '',
+          Link:     job.url || job.job_url || '',
+          Keyword:  keyword,
+        });
+      }
+
+      console.log(`    💰 With salary: ${jobs.length} total so far`);
+
+      // Respect rate limits
+      await sleep(2_000);
+
+    } catch (err) {
+      console.error(`  ❌ API error page ${page}:`, err.response?.status, err.message);
+      // If 401/403, API key may be stale — stop trying
+      if (err.response?.status === 401 || err.response?.status === 403) break;
+      await sleep(5_000);
+    }
+  }
+
+  return jobs;
 }
 
 // ====================== MAIN ======================
 
 async function runScraper() {
-  console.log('🚀 Starting ZipRecruiter Scraper...');
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+  console.log('🚀 Starting ZipRecruiter Scraper (API mode)...');
 
   const allJobs = [];
 
   for (const keyword of KEYWORDS) {
     console.log(`\n🔍 Keyword: "${keyword}"`);
-
-    for (let pageNum = 1; pageNum <= CONFIG.maxPages; pageNum++) {
-      let attempt = 0;
-
-      while (attempt < CONFIG.maxRetries) {
-        attempt++;
-        console.log(`  📄 Page ${pageNum} (attempt ${attempt})...`);
-
-        let page;
-        try {
-          page = await browser.newPage();
-          await page.setViewportSize({ width: 1920, height: 1080 });
-          await page.setExtraHTTPHeaders({
-            'Accept-Language': 'en-US,en;q=0.9',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          });
-
-          const url =
-            `https://www.ziprecruiter.com/jobs-search` +
-            `?search=${encodeURIComponent(keyword)}` +
-            `&location=United+States` +
-            `&page=${pageNum}`;
-
-          try {
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeout });
-          } catch (_) {
-            // timeout on full load is ok — grab what rendered
-          }
-          await sleep(12_000);
-          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-          await sleep(CONFIG.scrollDelay);
-
-          const result = await extractJobs(page, keyword);
-
-          console.log(`    🔗 Job links found: ${result.total} | 💰 With salary: ${result.withSalary}`);
-          console.log(`    📄 Page title: ${result.pageTitle}`);
-          console.log(`    📝 Body snippet: ${result.bodySnippet}`);
-
-          if (result.jobs.length > 0) {
-            allJobs.push(...result.jobs);
-            console.log('    📋 Sample:', result.jobs[0]);
-          }
-
-          await page.close();
-
-          if (result.total === 0) {
-            console.log('    ⚠️  No job links found – stopping pagination for this keyword');
-            pageNum = CONFIG.maxPages + 1;
-          }
-          break;
-
-        } catch (err) {
-          console.error(`    ❌ Error: ${err.message}`);
-          if (page) await page.close().catch(() => {});
-          if (attempt < CONFIG.maxRetries) await sleep(CONFIG.retryDelay);
-        }
-      }
-    }
+    const jobs = await fetchJobsForKeyword(keyword);
+    allJobs.push(...jobs);
+    console.log(`  ✅ "${keyword}" → ${jobs.length} jobs with salary`);
+    await sleep(3_000);
   }
-
-  await browser.close();
 
   // De-duplicate by Link
   const seen = new Set();
