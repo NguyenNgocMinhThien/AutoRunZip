@@ -1,9 +1,9 @@
-const axios      = require('axios');
-const cheerio    = require('cheerio');
-const XLSX       = require('xlsx');
-const fs         = require('fs');
-const FormData   = require('form-data');
-const { google } = require('googleapis');
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import XLSX from 'xlsx';
+import fs from 'fs';
+import FormData from 'form-data';
+import { google } from 'googleapis';
 
 // ==================== CẤU HÌNH ====================
 const KEYWORDS = [
