@@ -1,0 +1,20 @@
+{
+  "name": "ziprecruiter-scraper",
+  "version": "1.0.0",
+  "description": "ZipRecruiter job scraper – salary filter mode, GitHub Actions ready",
+  "main": "scraper.js",
+  "type": "module",
+  "scripts": {
+    "start": "node scraper.js",
+    "test": "node --experimental-vm-modules scraper.js"
+  },
+  "dependencies": {
+    "axios": "^1.15.0",
+    "form-data": "^4.0.0",
+    "playwright": "^1.44.0",
+    "xlsx": "^0.18.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
