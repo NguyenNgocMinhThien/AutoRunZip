@@ -2,7 +2,7 @@ name: Daily Job Scraper
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 02:00 UTC = 09:00 Vietnam time
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
