@@ -248,12 +248,14 @@ async function runScraper() {
             `&location=United+States` +
             `&page=${pageNum}`;
 
-          await page.goto(url, { waitUntil: 'networkidle', timeout: CONFIG.pageTimeout });
-          await sleep(8_000);
-
-          // Scroll to trigger lazy-loaded content
-          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-          await sleep(CONFIG.scrollDelay);
+          try {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.pageTimeout });
+} catch (_) {
+  // timeout on full load is ok — grab what rendered
+}
+await sleep(12_000);
+await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+await sleep(6_000);
 
           const result = await extractJobs(page, keyword);
 
