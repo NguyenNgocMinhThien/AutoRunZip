@@ -32,6 +32,25 @@ const CONFIG = {
 // Đặt 0 = lấy tất cả job có salary. Tăng lên để lọc, ví dụ: 80000 / 40
 const MIN_SALARY_YEAR = 0;
 const MIN_SALARY_HOUR = 0;
+
+const SCRAPER_KEYS = [
+  "a4e059153392eaaf06a9b3f4babc2efc",
+  "88e0fb0f3e8ea9bfc74e7e2c3774290d",
+  "e313e263da60619bd30790b5ac483258",
+  "f580a0a1b7c259634183ee1d7e970e58",
+  "589bf9aee2cbffd22f04fb6dc07592b5",
+  "a4879f66e9b5689e762c4fba46410a93",
+  "34bb3b67fd52766b99d09cc308f5b191",
+  "333d6263d4aa5f91efef17959b9e81c3",
+  "1a86bdd0e53fc24f2b9b785665791669",
+  
+];
+let keyIndex = 0;
+function getKey() {
+  const key = SCRAPER_KEYS[keyIndex % SCRAPER_KEYS.length];
+  keyIndex++;
+  return key;
+}
 // =====================================================
 
 const now   = new Date();
@@ -94,7 +113,7 @@ function salaryQualifies(salaryText) {
 async function scraperGet(url) {
   return axios.get('https://api.scraperapi.com/', {
     params: {
-      api_key:      process.env.SCRAPER_API_KEY,
+      api_key:      getKey(),
       url,
       country_code: 'us',
       render:       'true',
@@ -314,12 +333,6 @@ async function sendToTeams(jobCount, fileLink) {
 async function runScraper() {
   console.log("🚀 ZipRecruiter Scraper — US");
   console.log(`📋 ${KEYWORDS.length} keywords × ${LOCATIONS.length} location | Concurrency: ${CONFIG.concurrency}\n`);
-
-  if (!process.env.SCRAPER_API_KEY) {
-    console.error("❌ Thiếu SCRAPER_API_KEY! Hãy set env variable.");
-    process.exit(1);
-  }
-
   const allTasks = [];
   for (const kw of KEYWORDS) {
     for (const loc of LOCATIONS) {
